@@ -8,7 +8,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/nacos-group/nacos-sdk-go v1.0.10-0.20211025015044-554da083d462
 	github.com/soheilhy/cmux v0.1.5
-	github.com/xxjwxc/public v0.0.0-20260122140710-6f7ba42fba78
+	github.com/xxjwxc/public v0.0.0-20260228072651-9aec6824e727
 	go.etcd.io/etcd/client/v3 v3.5.5
 	google.golang.org/grpc v1.67.0
 )
@@ -75,4 +75,4 @@ require (
 
 // replace google.golang.org/grpc v1.40.0 => google.golang.org/grpc v1.29.1
 
-replace github.com/xxjwxc/public => ../public
+// replace github.com/xxjwxc/public => ../public

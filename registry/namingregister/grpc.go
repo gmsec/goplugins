@@ -79,6 +79,11 @@ type gRPCWatcher struct {
 // Next gets the next set of updates from the etcd resolver.
 // Calls to Next should be serialized; concurrent calls are not safe since
 // there is no way to reconcile the update ordering.
+//
+// 这里只负责把注册中心的变更转给上层,不再判断"谁还活着":
+// etcd 用 lease 到期删 key、mDNS 用记录过期,两者都会自然产生 Delete 事件。
+// 历史上的 metadata 时间戳判活已移除,它带来的时钟漂移、误删和写放大
+// 都随着原生机制接管而消失。
 func (gw *gRPCWatcher) Next() ([]*naming.Update, error) {
 	// watcher 已关闭:立即返回,否则调用方(grpc resolver)会永久阻塞
 	if err := gw.ctx.Err(); err != nil {
@@ -102,34 +107,11 @@ func (gw *gRPCWatcher) Next() ([]*naming.Update, error) {
 		return nil, err
 	}
 
-	offset := float64(time.Now().Unix()) - gw.HeartTimeout.Seconds()
-
-	var deleteUpdate []*naming.Update
-	updates := make([]*naming.Update, 0, len(list))
-	for _, jupdate := range list {
-		me, b := jupdate.Metadata.(float64)
-		if b && me > offset {
-			updates = append(updates, jupdate)
-		} else {
-			deleteUpdate = append(deleteUpdate, jupdate)
-		}
+	if len(list) > 0 {
+		mylog.Debugf("update(%v):%v", gw.serviceName, tools.JSONDecode(list))
 	}
 
-	if len(deleteUpdate) > 0 {
-		mylog.Debugf("delete(%v):%v", gw.serviceName, tools.JSONDecode(deleteUpdate))
-		gr := &GRPCResolver{Client: gw.c, HeartTimeout: gw.HeartTimeout}
-		for _, v := range deleteUpdate {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			gr.Update(ctx, gw.serviceName, naming.Update{
-				Op:   naming.Delete,
-				Addr: v.Addr,
-				// Metadata: r.port,
-			})
-			cancel()
-		}
-	}
-
-	return updates, nil
+	return list, nil
 }
 
 func (gw *gRPCWatcher) firstNext() ([]*naming.Update, error) {
@@ -148,34 +130,12 @@ func (gw *gRPCWatcher) firstNext() ([]*naming.Update, error) {
 		return nil, err
 	}
 
-	offset := float64(time.Now().Unix()) - gw.HeartTimeout.Seconds()
-	var deleteUpdate []*naming.Update
-	updates := make([]*naming.Update, 0, len(resp))
-	for _, jupdate := range resp {
-		me, b := jupdate.Metadata.(float64)
-		if b && me > offset {
-			updates = append(updates, jupdate)
-		} else {
-			deleteUpdate = append(deleteUpdate, jupdate)
-		}
+	if err := gw.c.Watch(gw.ctx, gw.target); err != nil {
+		gw.err = err
+		return nil, err
 	}
 
-	if len(deleteUpdate) > 0 {
-		gr := &GRPCResolver{Client: gw.c, HeartTimeout: gw.HeartTimeout}
-		for _, v := range deleteUpdate {
-			mylog.Debugf("delete(%v):%v", gw.serviceName, tools.JSONDecode(deleteUpdate))
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			gr.Update(ctx, gw.serviceName, naming.Update{
-				Op:   naming.Delete,
-				Addr: v.Addr,
-				// Metadata: r.port,
-			})
-			cancel()
-		}
-	}
-
-	gw.c.Watch(gw.ctx, gw.target)
-	return updates, nil
+	return resp, nil
 }
 
 func (gw *gRPCWatcher) Close() {

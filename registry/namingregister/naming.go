@@ -130,8 +130,10 @@ func (r *NamingRegister) Register(address string, Metadata interface{}) error {
 
 	gr := &GRPCResolver{Client: node}
 	up := naming.Update{
-		Op:       naming.Add,
-		Addr:     address,
+		Op:   naming.Add,
+		Addr: address,
+		// Metadata 保留时间戳是为了兼容滚动升级期间的旧客户端(它们仍按它判活),
+		// 新链路不再依赖这个值:活性和清理由 etcd 的 lease / mDNS 的记录过期负责。
 		Metadata: time.Now().Unix(),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -140,7 +142,11 @@ func (r *NamingRegister) Register(address string, Metadata interface{}) error {
 	return gr.Update(ctx, serviceName, up)
 }
 
-// startHeartbeatLocked 启动心跳,调用方必须已持有 r.Lock()
+// startHeartbeatLocked 启动心跳,调用方必须已持有 r.Lock()。
+//
+// 心跳的职责只是周期性刷新 value(携带新的时间戳),不再负责保活:
+// etcd 的存活由 lease 的 KeepAlive 维持,mDNS 由 DNS 记录的 TTL 维持。
+// 这样即使这里漏了一次,节点也不会被误判为下线。
 func (r *NamingRegister) startHeartbeatLocked(address string) {
 	r.stopHeartbeatLocked()
 
@@ -200,6 +206,7 @@ func (r *NamingRegister) Resolve(target string) (naming.Watcher, error) {
 
 	t := &GRPCResolver{Client: node.New(target), HeartTimeout: heartTimeout}
 
+	// HeartTimeout 现在只作为 firstNext 里 Get 的超时上限,不再用于判活。
 	return t.Resolve(target)
 }
 

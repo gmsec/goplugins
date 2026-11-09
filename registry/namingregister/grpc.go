@@ -27,7 +27,12 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-var ErrWatcherClosed = fmt.Errorf("naming: watch closed")
+var (
+	// ErrWatcherClosed watcher 已关闭
+	ErrWatcherClosed = fmt.Errorf("naming: watch closed")
+	// ErrClientClosed naming client 未初始化或已关闭
+	ErrClientClosed = fmt.Errorf("naming: client is nil or closed")
+)
 
 // GRPCResolver creates a grpc.Watcher for a target to track its resolution changes.
 type GRPCResolver struct {
@@ -37,6 +42,9 @@ type GRPCResolver struct {
 }
 
 func (gr *GRPCResolver) Update(ctx context.Context, target string, nm naming.Update) (err error) {
+	if gr.Client == nil {
+		return ErrClientClosed
+	}
 	switch nm.Op {
 	case naming.Add:
 		err = gr.Client.Put(ctx, target, nm)
@@ -49,6 +57,9 @@ func (gr *GRPCResolver) Update(ctx context.Context, target string, nm naming.Upd
 }
 
 func (gr *GRPCResolver) Resolve(target string) (naming.Watcher, error) {
+	if gr.Client == nil {
+		return nil, ErrClientClosed
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &gRPCWatcher{c: gr.Client, target: target, serviceName: target, ctx: ctx, cancel: cancel, HeartTimeout: gr.HeartTimeout}
 	return w, nil
@@ -69,6 +80,11 @@ type gRPCWatcher struct {
 // Calls to Next should be serialized; concurrent calls are not safe since
 // there is no way to reconcile the update ordering.
 func (gw *gRPCWatcher) Next() ([]*naming.Update, error) {
+	// watcher 已关闭:立即返回,否则调用方(grpc resolver)会永久阻塞
+	if err := gw.ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	if !gw.c.Watchering() {
 		// first Next() returns all addresses
 		return gw.firstNext()
@@ -80,7 +96,10 @@ func (gw *gRPCWatcher) Next() ([]*naming.Update, error) {
 	// process new events on target/*
 	list, err := gw.c.WatcherNext()
 	if err != nil {
-		return nil, gw.err
+		// 历史实现这里错写成 return nil, gw.err(gw.err 此刻为 nil),
+		// 导致真实错误被吞掉,调用方拿到 (nil, nil) 后空转。
+		gw.err = err
+		return nil, err
 	}
 
 	offset := float64(time.Now().Unix()) - gw.HeartTimeout.Seconds()
@@ -116,7 +135,15 @@ func (gw *gRPCWatcher) Next() ([]*naming.Update, error) {
 func (gw *gRPCWatcher) firstNext() ([]*naming.Update, error) {
 	// Use serialized request so resolution still works if the target etcd
 	// server is partitioned away from the quorum.
-	resp, err := gw.c.Get(gw.ctx, gw.target)
+	// 加超时,避免 Get 在网络异常时无限阻塞(历史实现直接传无超时的 ctx)
+	timeout := gw.HeartTimeout
+	if timeout <= 0 || timeout > 3*time.Second {
+		timeout = 3 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(gw.ctx, timeout)
+	defer cancel()
+
+	resp, err := gw.c.Get(ctx, gw.target)
 	if gw.err = err; err != nil {
 		return nil, err
 	}

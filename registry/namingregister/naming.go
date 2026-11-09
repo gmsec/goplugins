@@ -11,6 +11,7 @@ import (
 	"github.com/gmsec/micro/naming"
 	"github.com/gmsec/micro/registry"
 	"github.com/google/uuid"
+	"github.com/xxjwxc/public/mylog"
 	"github.com/xxjwxc/public/tools"
 )
 
@@ -20,14 +21,9 @@ type NamingRegister struct {
 	sync.Mutex
 	node    NamingClient
 	address string
-	// port    int
 
-	// watch mabey
-	// cancel context.CancelFunc
-	// ctx    context.Context
-	// isInit bool
-	// listener
-	// listener chan *mdns.ServiceEntry
+	// 心跳控制:done 关闭后心跳 goroutine 退出,避免每次 Register 泄漏一个 goroutine + ticker
+	done chan struct{}
 }
 
 func NewDNSNamingRegistry(nameCli NamingClient, opts ...registry.Option) registry.RegNaming {
@@ -45,7 +41,6 @@ func NewDNSNamingRegistry(nameCli NamingClient, opts ...registry.Option) registr
 	return &NamingRegister{
 		opts: options,
 		node: nameCli,
-		// isInit: true,
 	}
 }
 
@@ -53,12 +48,17 @@ func (r *NamingRegister) String() string {
 	return r.opts.ServiceName
 }
 
+// GetPort 获取当前注册端口的端口号
 func (r *NamingRegister) GetPort() int {
-	if len(r.opts.Addrs) == 0 {
+	r.Lock()
+	addrs := r.opts.Addrs
+	r.Unlock()
+
+	if len(addrs) == 0 {
 		return 0
 	}
 
-	_, pt, err := net.SplitHostPort(r.opts.Addrs[0])
+	_, pt, err := net.SplitHostPort(addrs[0])
 	if err != nil {
 		return 0
 	}
@@ -77,6 +77,8 @@ func (r *NamingRegister) Init(opts ...registry.Option) error {
 
 // Options get opts list
 func (r *NamingRegister) Options() registry.Options {
+	r.Lock()
+	defer r.Unlock()
 	return r.opts
 }
 
@@ -84,16 +86,22 @@ func (r *NamingRegister) Options() registry.Options {
 func (r *NamingRegister) Deregister() error {
 	r.Lock()
 	defer r.Unlock()
+
+	r.stopHeartbeatLocked()
+
 	if r.node != nil {
 		gr := &GRPCResolver{Client: r.node, HeartTimeout: r.opts.KeepHeartTimeout * 10}
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		gr.Update(ctx, r.opts.ServiceName, naming.Update{
+		if err := gr.Update(ctx, r.opts.ServiceName, naming.Update{
 			Op:   naming.Delete,
 			Addr: r.address,
-			// Metadata: r.port,
-		})
+		}); err != nil {
+			mylog.Error(err)
+		}
 		cancel()
-		r.node.Close()
+		if err := r.node.Close(); err != nil {
+			mylog.Error(err)
+		}
 		r.node = nil
 	}
 
@@ -103,7 +111,7 @@ func (r *NamingRegister) Deregister() error {
 // Register register & add new node
 func (r *NamingRegister) Register(address string, Metadata interface{}) error {
 	r.Lock()
-	defer r.Unlock()
+
 	// ip fix
 	if strings.HasPrefix(address, "[::]") {
 		address = tools.GetLocalIP() + address[4:]
@@ -111,40 +119,86 @@ func (r *NamingRegister) Register(address string, Metadata interface{}) error {
 		address = tools.GetLocalIP() + address
 	}
 	r.address = address
-	// ------end
+	r.startHeartbeatLocked(address)
+	node := r.node
+	serviceName := r.opts.ServiceName
+	r.Unlock()
 
-	gr := &GRPCResolver{Client: r.node}
-	//r.Resolve(fmt.Sprintf("127.0.0.1:%s", *port))
+	if node == nil { // 已 Deregister 后不可再注册,返回明确错误而不是 nil panic
+		return ErrClientClosed
+	}
+
+	gr := &GRPCResolver{Client: node}
 	up := naming.Update{
 		Op:       naming.Add,
-		Addr:     r.address,
+		Addr:     address,
 		Metadata: time.Now().Unix(),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	err := gr.Update(ctx, r.opts.ServiceName, up)
-	cancel()
-	// heart 心跳
+	defer cancel()
+
+	return gr.Update(ctx, serviceName, up)
+}
+
+// startHeartbeatLocked 启动心跳,调用方必须已持有 r.Lock()
+func (r *NamingRegister) startHeartbeatLocked(address string) {
+	r.stopHeartbeatLocked()
+
+	node, serviceName := r.node, r.opts.ServiceName
+	if node == nil {
+		return
+	}
+
+	interval := r.opts.KeepHeartTimeout
+	if interval <= 0 { // time.NewTicker 不接受非正数
+		interval = time.Second * 30
+	}
+
+	done := make(chan struct{})
+	r.done = done
+
 	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
 		for {
-			ticker := time.NewTicker(r.opts.KeepHeartTimeout)
-			<-ticker.C
-			up.Metadata = time.Now().Unix()
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			gr.Update(ctx, r.opts.ServiceName, up) // 发送心跳
-			cancel()
+			select {
+			case <-done: // 注销时退出
+				return
+			case <-ticker.C:
+				up := naming.Update{
+					Op:       naming.Add,
+					Addr:     address,
+					Metadata: time.Now().Unix(),
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				(&GRPCResolver{Client: node}).Update(ctx, serviceName, up) // 发送心跳
+				cancel()
+			}
 		}
 	}()
-	// ----------------------end
+}
 
-	return err
+// stopHeartbeatLocked 停止心跳,调用方必须已持有 r.Lock()
+func (r *NamingRegister) stopHeartbeatLocked() {
+	if r.done != nil {
+		close(r.done)
+		r.done = nil
+	}
 }
 
 // Resolve resolve begin
 func (r *NamingRegister) Resolve(target string) (naming.Watcher, error) {
 	r.Lock()
-	defer r.Unlock()
+	node := r.node
+	heartTimeout := r.opts.KeepHeartTimeout * 10
+	r.Unlock()
 
-	t := &GRPCResolver{Client: r.node.New(target), HeartTimeout: r.opts.KeepHeartTimeout * 10}
+	if node == nil {
+		return nil, ErrClientClosed
+	}
+
+	t := &GRPCResolver{Client: node.New(target), HeartTimeout: heartTimeout}
 
 	return t.Resolve(target)
 }

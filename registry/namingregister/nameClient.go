@@ -30,3 +30,14 @@ type NamingClient interface {
 	// Close close
 	Close() error
 }
+
+// ContextWatcher 是 NamingClient 的可选增强接口(保持 NamingClient 本身不变,
+// 下游已有实现无需改动即可继续工作)。实现后 GRPCResolver 会把 watcher 的 ctx
+// 传进来,使 Close()/cancel() 能唤醒阻塞在 <-ch 的 Next();未实现该接口时
+// 仍走旧的 WatcherNext()。
+//
+// 约定:实现应把 ctx.Done() 纳入阻塞等待的 select,并在压缩/重建 watch 时
+// 复用同一个 ctx,而不是 context.Background()。
+type ContextWatcher interface {
+	WatcherNextWithContext(ctx context.Context) ([]*naming.Update, error)
+}

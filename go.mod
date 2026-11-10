@@ -4,6 +4,8 @@ go 1.25.0
 
 require (
 	github.com/gin-gonic/gin v1.9.0
+	// 版本分叉提示:micro 钉死在 2024 版(原编译于 grpc 1.53 / go 1.18),与本地
+	// go 1.25 / grpc 1.79.1 不一致;风险与 replace 治理方式见 README.md「依赖版本分叉」。
 	github.com/gmsec/micro v0.0.0-20240126043355-ad68a05cb4f3
 	github.com/google/uuid v1.6.0
 	github.com/nacos-group/nacos-sdk-go v1.0.10-0.20211025015044-554da083d462

@@ -37,7 +37,11 @@ var (
 // GRPCResolver creates a grpc.Watcher for a target to track its resolution changes.
 type GRPCResolver struct {
 	// Client is an initialized etcd client.
-	Client       NamingClient
+	Client NamingClient
+	// Timeout 是 firstNext 里 Get 等单次操作的超时上限(由 Options.Timeout 收敛而来)。
+	Timeout time.Duration
+	// HeartTimeout 保留字段仅为兼容旧调用方,已不再用于 Get 超时上限。
+	// Deprecated: 请使用 Timeout。
 	HeartTimeout time.Duration
 }
 
@@ -61,19 +65,25 @@ func (gr *GRPCResolver) Resolve(target string) (naming.Watcher, error) {
 		return nil, ErrClientClosed
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	w := &gRPCWatcher{c: gr.Client, target: target, serviceName: target, ctx: ctx, cancel: cancel, HeartTimeout: gr.HeartTimeout}
+	w := &gRPCWatcher{
+		c:           gr.Client,
+		target:      target,
+		serviceName: target,
+		ctx:         ctx,
+		cancel:      cancel,
+		Timeout:     gr.Timeout,
+	}
 	return w, nil
 }
 
 type gRPCWatcher struct {
-	c      NamingClient
-	target string
-	ctx    context.Context
-	cancel context.CancelFunc
-	//wch          etcd.WatchChan
-	err          error
-	HeartTimeout time.Duration
-	serviceName  string
+	c           NamingClient
+	target      string
+	ctx         context.Context
+	cancel      context.CancelFunc
+	err         error
+	Timeout     time.Duration
+	serviceName string
 }
 
 // Next gets the next set of updates from the etcd resolver.
@@ -98,11 +108,19 @@ func (gw *gRPCWatcher) Next() ([]*naming.Update, error) {
 		return nil, gw.err
 	}
 
-	// process new events on target/*
-	list, err := gw.c.WatcherNext()
+	var (
+		list []*naming.Update
+		err  error
+	)
+	// 底层若支持 ContextWatcher,把 gw.ctx 传下去:Close()/cancel() 才能真正
+	// 唤醒阻塞在 <-ch 的 Next()。未实现的旧 NamingClient 仍走 WatcherNext()。
+	if cw, ok := gw.c.(ContextWatcher); ok {
+		list, err = cw.WatcherNextWithContext(gw.ctx)
+	} else {
+		list, err = gw.c.WatcherNext()
+	}
 	if err != nil {
-		// 历史实现这里错写成 return nil, gw.err(gw.err 此刻为 nil),
-		// 导致真实错误被吞掉,调用方拿到 (nil, nil) 后空转。
+		// 真实错误必须回传,不能被吞成 (nil, nil) 让调用方空转。
 		gw.err = err
 		return nil, err
 	}
@@ -117,10 +135,11 @@ func (gw *gRPCWatcher) Next() ([]*naming.Update, error) {
 func (gw *gRPCWatcher) firstNext() ([]*naming.Update, error) {
 	// Use serialized request so resolution still works if the target etcd
 	// server is partitioned away from the quorum.
-	// 加超时,避免 Get 在网络异常时无限阻塞(历史实现直接传无超时的 ctx)
-	timeout := gw.HeartTimeout
-	if timeout <= 0 || timeout > 3*time.Second {
-		timeout = 3 * time.Second
+	// 超时收敛到 Options.Timeout(见 naming.go requestTimeout),不再硬编码 3s;
+	// 同时以 gw.ctx 为父 ctx,Close()/cancel() 可以打断 Get。
+	timeout := gw.Timeout
+	if timeout < minOpTimeout {
+		timeout = minOpTimeout
 	}
 	ctx, cancel := context.WithTimeout(gw.ctx, timeout)
 	defer cancel()
@@ -139,6 +158,8 @@ func (gw *gRPCWatcher) firstNext() ([]*naming.Update, error) {
 }
 
 func (gw *gRPCWatcher) Close() {
-	gw.c.Close()
+	// 先 cancel:让可能阻塞在 Next()/WatcherNextWithContext() 的调用方立刻返回,
+	// 再关闭底层客户端。顺序反过来会让 Close() 在极端情况下等不到 Next() 退出。
 	gw.cancel()
+	_ = gw.c.Close()
 }

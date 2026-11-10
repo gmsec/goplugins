@@ -26,6 +26,11 @@ var leaseTTL int64 = 30
 
 type namingClient struct {
 	client *clientv3.Client
+	// ownClient 仅构造函数(clientv3.New)创建的实例为 true,表示由它负责
+	// 关闭底层 etcd client(内部持有 gRPC ClientConn / lease / watch goroutine)。
+	// New() 派生的 watcher 共享同一个 client,Close() 绝不提前关闭它。
+	ownClient bool
+	closeOnce sync.Once
 
 	// mu 保护下面的租约字段:Put 会被注册流程和心跳 goroutine 同时调用
 	mu       sync.Mutex
@@ -37,6 +42,12 @@ type namingClient struct {
 	wch      etcd.WatchChan
 	watchKey string
 	revision int64
+}
+
+// newNamingClient 构造函数创建的实例拥有 client;测试里直接
+// &namingClient{client: cli} 构造的实例 ownClient 为 false,不会被提前关闭。
+func newNamingClient(client *clientv3.Client, ownClient bool) *namingClient {
+	return &namingClient{client: client, ownClient: ownClient}
 }
 
 // Put puts a key-value pair.
@@ -163,13 +174,29 @@ func (nc *namingClient) Watch(ctx context.Context, key string) error {
 	return nil
 }
 
-// WatcherNext watching next
+// WatcherNext 兼容旧接口:不带 ctx,等价于 context.Background()。
 func (nc *namingClient) WatcherNext() ([]*naming.Update, error) {
+	return nc.WatcherNextWithContext(context.Background())
+}
+
+// WatcherNextWithContext 在阻塞等待事件时监听 ctx.Done(),让 Close()/cancel()
+// 能唤醒它;revision 压缩回退的 Get/Watch 也复用同一个 ctx,不再脱离婚
+// gw.cancel() 的管控(context.Background() 会让重建的 watch 永远收不到取消)。
+func (nc *namingClient) WatcherNextWithContext(ctx context.Context) ([]*naming.Update, error) {
 	wch := nc.wch
 	if wch == nil {
 		return nil, status.Error(codes.Unavailable, namingregister.ErrWatcherClosed.Error())
 	}
-	wr, ok := <-wch
+
+	select {
+	case wr, ok := <-wch:
+		return nc.applyWatchResponse(ctx, wr, ok)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (nc *namingClient) applyWatchResponse(ctx context.Context, wr etcd.WatchResponse, ok bool) ([]*naming.Update, error) {
 	if !ok {
 		return nil, status.Error(codes.Unavailable, namingregister.ErrWatcherClosed.Error())
 	}
@@ -177,11 +204,11 @@ func (nc *namingClient) WatcherNext() ([]*naming.Update, error) {
 	// revision 被压缩(通常是 watcher 断了很久),增量已经不可用。
 	// 回退成一次全量 Get 并重建 watch,对上层表现为"拿到一批 Add"。
 	if wr.CompactRevision != 0 {
-		list, err := nc.Get(context.Background(), nc.watchKey)
+		list, err := nc.Get(ctx, nc.watchKey)
 		if err != nil {
 			return nil, err
 		}
-		if err := nc.Watch(context.Background(), nc.watchKey); err != nil {
+		if err := nc.Watch(ctx, nc.watchKey); err != nil {
 			return nil, err
 		}
 		return list, nil
@@ -224,14 +251,14 @@ func decodeEvents(events []*clientv3.Event) []*naming.Update {
 
 // New new watching client.
 // 只共享底层 ClientConn,不继承租约:租约属于注册端的那个实例。
+// 派生实例 ownClient=false,Close() 不会关闭共享的 etcd client。
 func (nc *namingClient) New(serviceName string) namingregister.NamingClient {
-	return &namingClient{
-		client: nc.client,
-	}
+	return newNamingClient(nc.client, false)
 }
 
 // Close close.
-// 只停续期,不关闭共享的 etcd client(它可能还被其它客户端用着)。
+// 停续期;仅当本实例拥有 etcd client(构造函数创建)时才关闭它,
+// 避免 New() 派生的共享客户端被提前关闭。
 func (nc *namingClient) Close() error {
 	nc.mu.Lock()
 	cancelKA := nc.cancelKA
@@ -241,5 +268,12 @@ func (nc *namingClient) Close() error {
 	if cancelKA != nil {
 		cancelKA()
 	}
-	return nil
+
+	var err error
+	if nc.ownClient {
+		nc.closeOnce.Do(func() {
+			err = nc.client.Close()
+		})
+	}
+	return err
 }

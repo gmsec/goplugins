@@ -132,12 +132,24 @@ func RunHTTP(opts ...Option) (*server, error) {
 		return nil, fmt.Errorf("goplugins: gin router is nil")
 	}
 
+	// 同步 bind:拿到 listener 之后再打日志,保证日志对应的是"端口已监听";
+	// 端口占用等错误当场通过返回值暴露,不用等 Err() 通道。
+	lis, err := net.Listen("tcp", s.opt.addr)
+	if err != nil {
+		return nil, fmt.Errorf("goplugins: failed to listen %v: %w", s.opt.addr, err)
+	}
+	s.lis = lis
 	s.httpSrv = &http.Server{Addr: s.opt.addr, Handler: s.opt.router}
 	s.errCh = make(chan error, 1)
+
+	// 改用 http.Server 之后不再经过 gin 的 Run(),这里按 gin 的调试输出约定
+	// 把 "Listening and serving HTTP on :xx" 补回来。
+	debugPrintListening(s.opt.addr)
+
 	s.wg.Add(1)
 	go func() { // http
 		defer s.wg.Done()
-		if err := s.httpSrv.ListenAndServe(); err != nil && !isClosedError(err) {
+		if err := s.httpSrv.Serve(lis); err != nil && !isClosedError(err) {
 			err = fmt.Errorf("goplugins: http serve: %w", err)
 			s.reportErr(err)
 			mylog.Error(err)
@@ -146,6 +158,15 @@ func RunHTTP(opts ...Option) (*server, error) {
 	}()
 
 	return &s, nil
+}
+
+// debugPrintListening 复现 gin.Engine.Run 里的启动日志:
+// RunHTTP 不再调用 router.Run(),这行日志会丢失,按 gin 的输出约定补回来。
+func debugPrintListening(addr string) {
+	if !gin.IsDebugging() {
+		return
+	}
+	fmt.Fprintf(gin.DefaultWriter, "[GIN-debug] Listening and serving HTTP on %s\n", addr)
 }
 
 func debugPrintError(err error) {
